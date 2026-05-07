@@ -1,0 +1,15 @@
+[project]
+name = "apple-sound-head-tracking"
+version = "0.1.0"
+description = "Head-tracking audio balance control for macOS using webcam and CoreAudio"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "opencv-python>=4.8",
+    "mediapipe>=0.10",
+    "numpy>=1.24",
+    "pyobjc-framework-CoreAudio>=10.0",
+]
+
+[project.scripts]
+head-track-audio = "head_track_audio:main"

@@ -199,8 +199,8 @@ _LEFT_EAR = 234   # left tragion
 _RIGHT_EAR = 454  # right tragion
 
 # Empirical scale: a ratio of 1.0 corresponds to roughly this many degrees
-# of yaw.  Tuned so that a clear head turn maps to ~30-40°.
-_RATIO_TO_DEG = 55.0
+# of yaw.  Kept conservative so small head movements stay near zero.
+_RATIO_TO_DEG = 40.0
 
 
 def estimate_yaw(landmarks, frame_w: int, frame_h: int) -> float | None:
@@ -235,23 +235,39 @@ def estimate_yaw(landmarks, frame_w: int, frame_h: int) -> float | None:
 
 # ---------------------------------------------------------------------------
 # Yaw → balance mapping
+#
+# Design goal: the audio should feel like it's coming from the laptop.
+# Small head turns (typical during normal use) should produce very little
+# shift.  Only a deliberate, large turn should move the balance noticeably.
+#
+#   - Wide dead zone (±8°) so looking roughly at the screen = centred.
+#   - Saturation at ±45° — you have to really turn your head.
+#   - Max balance ±0.35 — even at full turn both ears still get most of
+#     the audio; it's a subtle spatial cue, not a hard pan.
+#   - Quadratic curve so the first few degrees beyond the dead zone
+#     barely register, and the effect ramps up gradually.
 # ---------------------------------------------------------------------------
 
-DEAD_ZONE_DEG = 5.0
-MAX_YAW_DEG = 30.0
-MAX_BALANCE = 0.6
+DEAD_ZONE_DEG = 8.0
+MAX_YAW_DEG = 45.0
+MAX_BALANCE = 0.38
 
 
 def yaw_to_balance(yaw_deg: float) -> float:
-    """Map a yaw angle (degrees) to a balance value with dead zone and clamp."""
+    """Map a yaw angle (degrees) to a balance value with dead zone and clamp.
+
+    Uses a quadratic curve so small movements are nearly silent and the
+    effect builds gradually with larger turns.
+    """
     if abs(yaw_deg) <= DEAD_ZONE_DEG:
         return 0.0
 
     sign = 1.0 if yaw_deg > 0 else -1.0
     effective = abs(yaw_deg) - DEAD_ZONE_DEG
-    span = MAX_YAW_DEG - DEAD_ZONE_DEG  # 25°
+    span = MAX_YAW_DEG - DEAD_ZONE_DEG  # 37°
     ratio = min(effective / span, 1.0)
-    return sign * ratio * MAX_BALANCE
+    # Quadratic curve: gentle at small angles, steeper at large ones.
+    return sign * (ratio ** 2) * MAX_BALANCE
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +283,7 @@ class SmoothedYaw:
              smoother, less laggy response than a single very-low-alpha EMA.
     """
 
-    def __init__(self, alpha: float = 0.18, max_jump: float = 25.0):
+    def __init__(self, alpha: float = 0.28, max_jump: float = 25.0):
         self.alpha = alpha
         self.max_jump = max_jump
         self._s1 = 0.0  # first EMA stage
@@ -360,6 +376,10 @@ def main() -> None:
         print("ERROR: Could not open webcam (index 0).", file=sys.stderr)
         sys.exit(1)
 
+    # Lower resolution for faster color conversion and inference.
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -388,8 +408,8 @@ def main() -> None:
     landmarker = FaceLandmarker.create_from_options(options)
 
     yaw_smoother = SmoothedYaw(alpha=0.18, max_jump=25.0)
-    balance_smoother = EMA(alpha=0.08, initial=0.0)
-    frame_interval = 1.0 / 30.0  # cap at 30 fps
+    balance_smoother = EMA(alpha=0.18, initial=0.0)
+    frame_interval = 1.0 / 60.0  # cap at 60 fps
     frame_count = 0
     last_yaw = None          # last successfully estimated yaw
     no_face_since = None     # monotonic time when face was last lost
@@ -424,43 +444,37 @@ def main() -> None:
 
             frame_count += 1
 
-            # Skip every other frame for MediaPipe inference.
-            run_inference = frame_count % 2 == 0
+            # Run MediaPipe on every frame for snappier tracking.
             yaw_deg = None
-            face_found = None  # None = no inference this frame
+            face_found = None
 
-            if run_inference:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(
-                    image_format=mp.ImageFormat.SRGB, data=rgb
-                )
-                timestamp_ms = int(time.monotonic() * 1000)
-                results = landmarker.detect_for_video(mp_image, timestamp_ms)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB, data=rgb
+            )
+            timestamp_ms = int(time.monotonic() * 1000)
+            results = landmarker.detect_for_video(mp_image, timestamp_ms)
 
-                if results.face_landmarks:
-                    lm = results.face_landmarks[0]
-                    yaw_deg = estimate_yaw(lm, frame_w, frame_h)
+            if results.face_landmarks:
+                lm = results.face_landmarks[0]
+                yaw_deg = estimate_yaw(lm, frame_w, frame_h)
 
-                face_found = yaw_deg is not None
+            face_found = yaw_deg is not None
 
             # Decide the balance target.
-            if face_found is True:
+            if face_found:
                 # Good detection — smooth the raw yaw first.
                 smooth_yaw = yaw_smoother.update(yaw_deg)
                 last_yaw = smooth_yaw
                 no_face_since = None
                 target = yaw_to_balance(smooth_yaw)
-            elif face_found is False:
-                # Inference ran but no usable face — start drifting to centre.
+            else:
+                # No usable face — drift to centre.
                 if no_face_since is None:
                     no_face_since = time.monotonic()
-                # Gradually reduce target toward 0 over ~1 s.
                 elapsed_no_face = time.monotonic() - no_face_since
                 fade = max(0.0, 1.0 - elapsed_no_face)
                 target = yaw_to_balance(last_yaw) * fade if last_yaw is not None else 0.0
-            else:
-                # Skipped frame — hold the previous target.
-                target = balance_smoother.value
 
             balance = balance_smoother.update(target)
 

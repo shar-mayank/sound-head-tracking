@@ -10,3 +10,4 @@ wheels/
 .venv
 face_landmarker.task
 .python-version
+.DS_Store

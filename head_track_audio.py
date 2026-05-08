@@ -301,9 +301,11 @@ class SmoothedYaw:
             self._initialised = True
             return sample
 
-        # Outlier gate: if the new sample jumps too far, ignore it.
-        if abs(sample - self._s1) > self.max_jump:
-            return self._s2
+        # Outlier gate: clamp large jumps instead of ignoring them,
+        # so fast head snaps still move toward the new position.
+        diff = sample - self._s1
+        if abs(diff) > self.max_jump:
+            sample = self._s1 + self.max_jump * (1.0 if diff > 0 else -1.0)
 
         self._s1 += self.alpha * (sample - self._s1)
         self._s2 += self.alpha * (self._s1 - self._s2)

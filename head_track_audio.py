@@ -144,13 +144,21 @@ class _BalanceController:
         return f"L={self._orig_left:.2f} R={self._orig_right:.2f}"
 
     def set_balance(self, value: float) -> None:
-        """Apply *value* (-1.0 … 1.0) as a stereo balance offset."""
+        """Apply *value* (-1.0 … 1.0) as a stereo balance offset.
+
+        The value is treated as an offset from the device's original state
+        so that 0.0 means "no change from what the user had before the app
+        started".  This works correctly regardless of the device's initial
+        pan/volume.
+        """
         value = max(-1.0, min(1.0, value))
         if self._use_stereo_pan:
+            # Add offset to the original pan, clamped to [-1, 1].
+            new_pan = max(-1.0, min(1.0, self._orig_pan + value))
             addr = (kAudioDevicePropertyStereoPan,
                     kAudioObjectPropertyScopeOutput,
                     kAudioObjectPropertyElementMain)
-            _set_property_float(self.device_id, addr, value)
+            _set_property_float(self.device_id, addr, new_pan)
         else:
             # Scale the quieter channel down.  balance < 0 → reduce right,
             # balance > 0 → reduce left.  At balance = 0 both stay original.
@@ -169,7 +177,10 @@ class _BalanceController:
         """Restore original balance / volumes."""
         try:
             if self._use_stereo_pan:
-                self.set_balance(0.0)
+                addr = (kAudioDevicePropertyStereoPan,
+                        kAudioObjectPropertyScopeOutput,
+                        kAudioObjectPropertyElementMain)
+                _set_property_float(self.device_id, addr, self._orig_pan)
             else:
                 _set_property_float(self.device_id, self._left_addr, self._orig_left)
                 _set_property_float(self.device_id, self._right_addr, self._orig_right)
@@ -394,8 +405,14 @@ def main() -> None:
         bal_ctrl.restore()
 
     atexit.register(restore_balance)
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    _running = True
+
+    def _stop(*_args):
+        nonlocal _running
+        _running = False
+
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
 
     # --- Startup: MediaPipe FaceLandmarker (tasks API) ---
     model_path = _ensure_model()
@@ -415,6 +432,7 @@ def main() -> None:
     frame_count = 0
     last_yaw = None          # last successfully estimated yaw
     no_face_since = None     # monotonic time when face was last lost
+    WARMUP_FRAMES = 10       # ignore first N frames (detection is noisy)
 
     print("=" * 56)
     print("  Head-Tracking Audio Balance  (macOS CoreAudio)")
@@ -426,7 +444,7 @@ def main() -> None:
     print(f"  Max balance   : +/-{MAX_BALANCE}")
     print(f"  Max yaw       : +/-{MAX_YAW_DEG:.0f} deg")
     print("-" * 56)
-    print("  Press Ctrl+C to quit (balance resets to 0.0).")
+    print("  Press Ctrl+C to quit (balance restored).")
     print("-" * 56)
     print()
 
@@ -437,14 +455,22 @@ def main() -> None:
     os.dup2(_devnull.fileno(), 2)
 
     try:
-        while True:
+        while _running:
             loop_start = time.monotonic()
 
             ret, frame = cap.read()
             if not ret:
                 continue
 
+            # Flip horizontally — Mac webcams mirror the image, which
+            # inverts left/right and makes yaw point the wrong way.
+            frame = cv2.flip(frame, 1)
+
             frame_count += 1
+
+            # Skip warmup frames — early detections are often jittery.
+            if frame_count <= WARMUP_FRAMES:
+                continue
 
             # Run MediaPipe on every frame for snappier tracking.
             yaw_deg = None
@@ -479,6 +505,10 @@ def main() -> None:
                 target = yaw_to_balance(last_yaw) * fade if last_yaw is not None else 0.0
 
             balance = balance_smoother.update(target)
+
+            # Negate: head turns left → sound shifts right (toward the
+            # laptop), so the audio feels anchored to the screen.
+            balance = -balance
 
             # Apply to system audio.
             try:

@@ -108,8 +108,6 @@ class _BalanceController:
     def __init__(self, device_id: int):
         self.device_id = device_id
         self._use_stereo_pan = False
-        self._orig_left = 1.0
-        self._orig_right = 1.0
         # For PerChannelVolume: track the "user-intended" base volume so we
         # don't feed our own balance-adjusted values back into the next frame.
         self._last_base = None
@@ -135,17 +133,11 @@ class _BalanceController:
             raise RuntimeError(
                 "Output device supports neither StereoPan nor per-channel "
                 "VolumeScalar — cannot control balance.")
-        self._orig_left = _get_property_float(device_id, self._left_addr)
-        self._orig_right = _get_property_float(device_id, self._right_addr)
-        # Normalize near-equal L/R volumes to avoid displaying spurious
-        # asymmetry caused by CoreAudio floating-point imprecision.
-        if abs(self._orig_left - self._orig_right) < 0.02:
-            base = round(max(self._orig_left, self._orig_right), 2)
-            self._orig_left = base
-            self._orig_right = base
-            _set_property_float(device_id, self._left_addr, base)
-            _set_property_float(device_id, self._right_addr, base)
-        self._last_base = max(self._orig_left, self._orig_right)
+        # Read current volumes but DON'T write anything — the user's
+        # current volume setting must not be disturbed on startup.
+        cur_left = _get_property_float(device_id, self._left_addr)
+        cur_right = _get_property_float(device_id, self._right_addr)
+        self._last_base = max(cur_left, cur_right)
 
     # -- public API --
 
@@ -158,7 +150,8 @@ class _BalanceController:
         if self._use_stereo_pan:
             # Convert from 0..1 StereoPan to -1..+1 display range.
             return f"{self._orig_pan * 2.0 - 1.0:+.2f}"
-        return f"L={self._orig_left:.2f} R={self._orig_right:.2f}"
+        base = self._last_base if self._last_base is not None else 0.0
+        return f"vol={base:.2f}"
 
     def set_balance(self, value: float) -> None:
         """Apply *value* (-1.0 … 1.0) as a stereo balance.
@@ -209,16 +202,25 @@ class _BalanceController:
             self._last_balance = value
 
     def restore(self) -> None:
-        """Restore original balance / volumes."""
+        """Centre the balance without changing the user's current volume.
+
+        StereoPan: set pan to 0.5 (centre).
+        PerChannelVolume: read the current L/R levels and set both to the
+        louder channel's value, so the balance is centred at whatever
+        volume the user currently has.
+        """
         try:
             if self._use_stereo_pan:
                 addr = (kAudioDevicePropertyStereoPan,
                         kAudioObjectPropertyScopeOutput,
                         kAudioObjectPropertyElementMain)
-                _set_property_float(self.device_id, addr, self._orig_pan)
+                _set_property_float(self.device_id, addr, 0.5)
             else:
-                _set_property_float(self.device_id, self._left_addr, self._orig_left)
-                _set_property_float(self.device_id, self._right_addr, self._orig_right)
+                cur_left = _get_property_float(self.device_id, self._left_addr)
+                cur_right = _get_property_float(self.device_id, self._right_addr)
+                level = max(cur_left, cur_right)
+                _set_property_float(self.device_id, self._left_addr, level)
+                _set_property_float(self.device_id, self._right_addr, level)
         except Exception:
             pass
 

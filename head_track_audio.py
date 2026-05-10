@@ -15,6 +15,7 @@ import signal
 import struct
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 # Suppress noisy MediaPipe / TensorFlow Lite / absl logging before imports.
 os.environ["GLOG_minloglevel"] = "3"
@@ -94,7 +95,7 @@ def get_default_output_device() -> int:
 #
 # Strategy:
 #   1. If the device supports kAudioDevicePropertyStereoPan, use it directly
-#      (Float32 in -1.0 … 1.0).
+#      (Float32 in 0.0 … 1.0, where 0.0 = left, 0.5 = centre, 1.0 = right).
 #   2. Otherwise fall back to per-channel VolumeScalar on elements 1 (left)
 #      and 2 (right).  We record the original volumes on startup and scale
 #      them: the "quieter" side is reduced proportionally to the balance
@@ -109,6 +110,12 @@ class _BalanceController:
         self._use_stereo_pan = False
         self._orig_left = 1.0
         self._orig_right = 1.0
+        # For PerChannelVolume: track the "user-intended" base volume so we
+        # don't feed our own balance-adjusted values back into the next frame.
+        self._last_base = None
+        # The last balance value we applied (so we can back-calculate the
+        # user's intended volume when they change it mid-run).
+        self._last_balance = 0.0
 
         pan_addr = (kAudioDevicePropertyStereoPan,
                     kAudioObjectPropertyScopeOutput,
@@ -130,6 +137,15 @@ class _BalanceController:
                 "VolumeScalar — cannot control balance.")
         self._orig_left = _get_property_float(device_id, self._left_addr)
         self._orig_right = _get_property_float(device_id, self._right_addr)
+        # Normalize near-equal L/R volumes to avoid displaying spurious
+        # asymmetry caused by CoreAudio floating-point imprecision.
+        if abs(self._orig_left - self._orig_right) < 0.02:
+            base = round(max(self._orig_left, self._orig_right), 2)
+            self._orig_left = base
+            self._orig_right = base
+            _set_property_float(device_id, self._left_addr, base)
+            _set_property_float(device_id, self._right_addr, base)
+        self._last_base = max(self._orig_left, self._orig_right)
 
     # -- public API --
 
@@ -140,36 +156,45 @@ class _BalanceController:
     @property
     def original_description(self) -> str:
         if self._use_stereo_pan:
-            return f"{self._orig_pan:+.2f}"
+            # Convert from 0..1 StereoPan to -1..+1 display range.
+            return f"{self._orig_pan * 2.0 - 1.0:+.2f}"
         return f"L={self._orig_left:.2f} R={self._orig_right:.2f}"
 
     def set_balance(self, value: float) -> None:
-        """Apply *value* (-1.0 … 1.0) as a stereo balance offset.
+        """Apply *value* (-1.0 … 1.0) as a stereo balance.
 
-        The value is treated as an offset from the device's original state
-        so that 0.0 means "no change from what the user had before the app
-        started".  This works correctly regardless of the device's initial
-        pan/volume.
+        StereoPan: convert balance to 0..1 pan range and set it (ignoring
+        the device's original pan — we own it while the script runs and
+        restore on exit).
+
+        PerChannelVolume: detect user volume changes by comparing the
+        current louder channel against what we last wrote, then apply
+        the balance ratio to the user's intended base volume.
         """
         value = max(-1.0, min(1.0, value))
         if self._use_stereo_pan:
-            # Add offset to the original pan, clamped to [-1, 1].
-            new_pan = max(-1.0, min(1.0, self._orig_pan + value))
             addr = (kAudioDevicePropertyStereoPan,
                     kAudioObjectPropertyScopeOutput,
                     kAudioObjectPropertyElementMain)
-            _set_property_float(self.device_id, addr, new_pan)
+            # StereoPan range is 0.0 (left) .. 1.0 (right); convert from
+            # balance range -1.0 .. +1.0.
+            pan = (value + 1.0) / 2.0
+            _set_property_float(self.device_id, addr, pan)
         else:
-            # Read the current volumes so user volume changes are respected.
-            # We treat the louder channel as the "base" and reduce the
-            # quieter side proportionally to the balance value.
+            # Read current volumes to detect user volume changes.
             cur_left = _get_property_float(self.device_id, self._left_addr)
             cur_right = _get_property_float(self.device_id, self._right_addr)
+            cur_max = max(cur_left, cur_right)
 
-            # Use the max of the two as the reference level — this is what
-            # the user set via the volume keys.  When balance is 0 both
-            # channels should be at this level.
-            base = max(cur_left, cur_right)
+            # Figure out what we *expected* the louder channel to be based
+            # on our last write.  If the actual value differs significantly,
+            # the user changed the volume externally — update our base.
+            if self._last_base is not None:
+                expected_loud = self._last_base  # we always set the loud side to base
+                if abs(cur_max - expected_loud) > 0.005:
+                    # User changed volume — adopt the new level.
+                    self._last_base = cur_max
+            base = self._last_base if self._last_base is not None else cur_max
 
             if value <= 0:
                 left_vol = base
@@ -181,6 +206,7 @@ class _BalanceController:
                                 max(0.0, min(1.0, left_vol)))
             _set_property_float(self.device_id, self._right_addr,
                                 max(0.0, min(1.0, right_vol)))
+            self._last_balance = value
 
     def restore(self) -> None:
         """Restore original balance / volumes."""
@@ -392,15 +418,48 @@ def _ensure_model() -> str:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # --- Startup: open webcam ---
-    cap = cv2.VideoCapture(0)
+    # --- Download model if needed (before suppressing stderr) ---
+    model_path = _ensure_model()
+
+    # Suppress stderr to hide C++ log spam (MediaPipe/TF/absl) during init.
+    _init_devnull = os.open(os.devnull, os.O_WRONLY)
+    _init_stderr = os.dup(2)
+    os.dup2(_init_devnull, 2)
+
+    # --- Parallel startup: webcam + MediaPipe model load ---
+    def _open_cam():
+        c = cv2.VideoCapture(0)
+        if c.isOpened():
+            c.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            c.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        return c
+
+    def _load_landmarker():
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path,
+                                     delegate=BaseOptions.Delegate.CPU),
+            running_mode=RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.6,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        return FaceLandmarker.create_from_options(options)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cam_future = pool.submit(_open_cam)
+        lm_future = pool.submit(_load_landmarker)
+        cap = cam_future.result()
+        landmarker = lm_future.result()
+
+    # Restore stderr for user-facing output.
+    os.dup2(_init_stderr, 2)
+    os.close(_init_stderr)
+    os.close(_init_devnull)
+
     if not cap.isOpened():
         print("ERROR: Could not open webcam (index 0).", file=sys.stderr)
         sys.exit(1)
-
-    # Lower resolution for faster color conversion and inference.
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -422,18 +481,6 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-
-    # --- Startup: MediaPipe FaceLandmarker (tasks API) ---
-    model_path = _ensure_model()
-    options = FaceLandmarkerOptions(
-        base_options=BaseOptions(model_asset_path=model_path),
-        running_mode=RunningMode.VIDEO,
-        num_faces=1,
-        min_face_detection_confidence=0.6,
-        min_face_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    landmarker = FaceLandmarker.create_from_options(options)
 
     yaw_smoother = SmoothedYaw(alpha=0.18, max_jump=25.0)
     balance_smoother = EMA(alpha=0.18, initial=0.0)
@@ -466,6 +513,29 @@ def main() -> None:
     try:
         while _running:
             loop_start = time.monotonic()
+
+            # Detect output device changes (e.g. headphone hot-swap).
+            try:
+                new_device_id = get_default_output_device()
+            except RuntimeError:
+                new_device_id = device_id
+            if new_device_id != device_id:
+                # Restore old device, switch to new one.
+                bal_ctrl.restore()
+                device_id = new_device_id
+                try:
+                    bal_ctrl = _BalanceController(device_id)
+                except RuntimeError as e:
+                    print(f"\n  WARNING: new device unsupported ({e}), waiting...")
+                    time.sleep(1)
+                    continue
+                # Reset smoothers so we don't carry stale balance into new device.
+                balance_smoother = EMA(alpha=0.18, initial=0.0)
+                print(
+                    f"\r  Switched to device id {device_id} ({bal_ctrl.method})"
+                    f"                        ",
+                    flush=True,
+                )
 
             ret, frame = cap.read()
             if not ret:
@@ -551,7 +621,7 @@ def main() -> None:
         cap.release()
         landmarker.close()
         restore_balance()
-        print("\n  Balance restored. Goodbye.")
+        print("\n  Balance restored. Goodbye :)")
 
 
 if __name__ == "__main__":

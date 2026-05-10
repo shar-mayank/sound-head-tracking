@@ -160,14 +160,23 @@ class _BalanceController:
                     kAudioObjectPropertyElementMain)
             _set_property_float(self.device_id, addr, new_pan)
         else:
-            # Scale the quieter channel down.  balance < 0 → reduce right,
-            # balance > 0 → reduce left.  At balance = 0 both stay original.
+            # Read the current volumes so user volume changes are respected.
+            # We treat the louder channel as the "base" and reduce the
+            # quieter side proportionally to the balance value.
+            cur_left = _get_property_float(self.device_id, self._left_addr)
+            cur_right = _get_property_float(self.device_id, self._right_addr)
+
+            # Use the max of the two as the reference level — this is what
+            # the user set via the volume keys.  When balance is 0 both
+            # channels should be at this level.
+            base = max(cur_left, cur_right)
+
             if value <= 0:
-                left_vol = self._orig_left
-                right_vol = self._orig_right * (1.0 + value)  # value is negative
+                left_vol = base
+                right_vol = base * (1.0 + value)   # value is negative
             else:
-                left_vol = self._orig_left * (1.0 - value)
-                right_vol = self._orig_right
+                left_vol = base * (1.0 - value)
+                right_vol = base
             _set_property_float(self.device_id, self._left_addr,
                                 max(0.0, min(1.0, left_vol)))
             _set_property_float(self.device_id, self._right_addr,

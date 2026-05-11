@@ -23,14 +23,9 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["GRPC_VERBOSITY"] = "ERROR"
 os.environ["MEDIAPIPE_DISABLE_GPU"] = "1"
 
-import cv2
-import mediapipe as mp
-from mediapipe.tasks.python import BaseOptions
-from mediapipe.tasks.python.vision import (
-    FaceLandmarker,
-    FaceLandmarkerOptions,
-    RunningMode,
-)
+# cv2 and mediapipe are heavy C-extension imports (~0.5-1.5 s combined).
+# They are deferred to the parallel startup threads in main() so their
+# initialisation overlaps with each other and with the webcam open.
 
 # ---------------------------------------------------------------------------
 # CoreAudio via pyobjc-framework-CoreAudio
@@ -88,6 +83,50 @@ def get_default_output_device() -> int:
                kAudioObjectPropertyScopeGlobal,
                kAudioObjectPropertyElementMain)
     return _get_property_uint32(kAudioObjectSystemObject, address)
+
+
+def get_device_name(device_id: int) -> str:
+    """Return the human-readable name of an audio device, or '' on failure.
+
+    Uses ctypes against the CoreAudio/CoreFoundation C libraries because the
+    pyobjc AudioObjectGetPropertyData wrapper returns raw bytes that are not
+    directly usable for CFStringRef properties.
+    """
+    import ctypes
+    import ctypes.util
+    try:
+        _ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio"))
+        _cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+
+        class _Addr(ctypes.Structure):
+            _fields_ = [("sel",   ctypes.c_uint32),
+                        ("scope", ctypes.c_uint32),
+                        ("elem",  ctypes.c_uint32)]
+
+        # kAudioObjectPropertyName = 'lnam', global scope, main element.
+        addr  = _Addr(_FOURCC("lnam"), _FOURCC("glob"), 0)
+        cfstr = ctypes.c_void_p(0)
+        size  = ctypes.c_uint32(ctypes.sizeof(ctypes.c_void_p))
+
+        status = _ca.AudioObjectGetPropertyData(
+            ctypes.c_uint32(device_id),
+            ctypes.byref(addr),
+            ctypes.c_uint32(0), None,
+            ctypes.byref(size),
+            ctypes.byref(cfstr),
+        )
+        if status != 0 or not cfstr.value:
+            return ""
+
+        buf = ctypes.create_string_buffer(512)
+        _cf.CFStringGetCString(
+            cfstr, buf, ctypes.c_long(512),
+            ctypes.c_uint32(0x08000100),  # kCFStringEncodingUTF8
+        )
+        _cf.CFRelease(cfstr)
+        return buf.value.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -428,15 +467,25 @@ def main() -> None:
     _init_stderr = os.dup(2)
     os.dup2(_init_devnull, 2)
 
-    # --- Parallel startup: webcam + MediaPipe model load ---
+    # --- Parallel startup: webcam open + MediaPipe model load ---
+    # Each worker lazily imports its heavy C-extension (cv2 / mediapipe)
+    # so the two imports overlap in parallel threads.
     def _open_cam():
-        c = cv2.VideoCapture(0)
+        import cv2
+        c = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
         if c.isOpened():
-            c.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            c.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        return c
+            c.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+            c.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
+        return cv2, c
 
     def _load_landmarker():
+        import mediapipe as mp
+        from mediapipe.tasks.python import BaseOptions
+        from mediapipe.tasks.python.vision import (
+            FaceLandmarker,
+            FaceLandmarkerOptions,
+            RunningMode,
+        )
         options = FaceLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path,
                                      delegate=BaseOptions.Delegate.CPU),
@@ -446,13 +495,13 @@ def main() -> None:
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-        return FaceLandmarker.create_from_options(options)
+        return mp, FaceLandmarker.create_from_options(options)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         cam_future = pool.submit(_open_cam)
         lm_future = pool.submit(_load_landmarker)
-        cap = cam_future.result()
-        landmarker = lm_future.result()
+        cv2, cap = cam_future.result()
+        mp, landmarker = lm_future.result()
 
     # Restore stderr for user-facing output.
     os.dup2(_init_stderr, 2)
@@ -490,13 +539,15 @@ def main() -> None:
     frame_count = 0
     last_yaw = None          # last successfully estimated yaw
     no_face_since = None     # monotonic time when face was last lost
-    WARMUP_FRAMES = 10       # ignore first N frames (detection is noisy)
+    WARMUP_FRAMES = 4        # ignore first N frames (detection is noisy)
 
+    device_name = get_device_name(device_id)
+    device_label = f"{device_name} (id {device_id})" if device_name else f"id {device_id}"
     print("=" * 56)
     print("  Head-Tracking Audio Balance  (macOS CoreAudio)")
     print("=" * 56)
     print(f"  Webcam        : index 0  ({frame_w}x{frame_h})")
-    print(f"  Output device : id {device_id}  ({bal_ctrl.method})")
+    print(f"  Output device : {device_label}  ({bal_ctrl.method})")
     print(f"  Original bal. : {bal_ctrl.original_description}")
     print(f"  Dead zone     : +/-{DEAD_ZONE_DEG:.0f} deg")
     print(f"  Max balance   : +/-{MAX_BALANCE}")

@@ -9,7 +9,7 @@ import Foundation
 
 let kDeadZoneDeg: Double = 8.0
 let kMaxYawDeg:   Double = 45.0
-let kMaxBalance:  Double = 0.38
+let kMaxBalance:  Double = 0.50
 
 /// Scale converting the eye/nose geometric ratio into degrees of yaw.
 /// (Eyes sit closer together than ears, so this is smaller than the Python

@@ -38,8 +38,13 @@ final class HeadTracker: NSObject {
     /// if the left/right sense is ever inverted on a particular machine.
     private let kYawSign: Double = -1.0
 
-    /// Frames per second to *process* with Vision (camera is also capped here).
-    private let targetFPS: Double = 12.0
+    /// Adaptive processing rate: poll slowly while the head is still, ramp up
+    /// to the fast rate the instant motion is detected.  Keeps idle CPU low
+    /// without sacrificing snappiness during turns.
+    private let idleFPS:   Double = 8.0    // head still
+    private let activeFPS: Double = 30.0   // head moving
+    private let motionThresholdDeg: Double = 1.5   // yaw change that counts as motion
+    private let activeHold: TimeInterval  = 0.8    // stay fast this long after motion
 
     weak var delegate: HeadTrackerDelegate?
 
@@ -56,9 +61,10 @@ final class HeadTracker: NSObject {
         return r
     }()
 
-    // Vision-processing throttle (capture-queue only).
+    // Adaptive throttle state (capture-queue only).
     private var lastProcess: TimeInterval = 0
-    private var minInterval: TimeInterval { 1.0 / 13.0 }   // slightly > targetFPS
+    private var activeUntil: TimeInterval = 0
+    private var lastProcessedYaw: Double?
 
     // Watchdog: monotonic timestamp of the last delivered camera frame.
     private let stateLock = NSLock()
@@ -143,14 +149,14 @@ final class HeadTracker: NSObject {
 
         sess.addInput(input)
 
-        // Cap camera frame rate (best effort) to cut capture + Vision cost.
+        // Cap camera frame rate to the fast (active) rate; we throttle Vision
+        // below this when idle.  Best effort — only the min duration is forced
+        // so the camera can still deliver up to `activeFPS`.
         if let range = camera.activeFormat.videoSupportedFrameRateRanges.first,
-           Double(range.minFrameRate) <= targetFPS,
-           targetFPS <= Double(range.maxFrameRate),
+           activeFPS <= Double(range.maxFrameRate),
            (try? camera.lockForConfiguration()) != nil {
-            let d = CMTime(value: 1, timescale: CMTimeScale(targetFPS))
-            camera.activeVideoMinFrameDuration = d
-            camera.activeVideoMaxFrameDuration = d
+            camera.activeVideoMinFrameDuration =
+                CMTime(value: 1, timescale: CMTimeScale(activeFPS))
             camera.unlockForConfiguration()
         }
 
@@ -176,6 +182,9 @@ final class HeadTracker: NSObject {
 
         session = sess
         running = true
+        lastProcess      = 0
+        activeUntil      = 0
+        lastProcessedYaw = nil
         markFrame()            // seed watchdog
         sess.startRunning()
     }
@@ -213,9 +222,10 @@ extension HeadTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         markFrame()   // camera liveness (watchdog) — every received frame
 
-        // Throttle expensive Vision work to ~targetFPS.
+        // Adaptive throttle: fast while the head is moving, slow when idle.
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastProcess >= minInterval else { return }
+        let fps = (now < activeUntil) ? activeFPS : idleFPS
+        guard now - lastProcess >= 1.0 / (fps + 1.0) else { return }
         lastProcess = now
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
@@ -235,6 +245,12 @@ extension HeadTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
         // Face present but low-quality landmarks → SKIP (hold last value)
         // rather than collapse the yaw toward zero.
         guard let yaw = Self.geometricYaw(face, sign: kYawSign) else { return }
+
+        // Motion detection → enter fast mode for a short hold window.
+        if let prev = lastProcessedYaw, abs(yaw - prev) > motionThresholdDeg {
+            activeUntil = now + activeHold
+        }
+        lastProcessedYaw = yaw
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }

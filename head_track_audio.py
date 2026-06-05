@@ -337,7 +337,7 @@ def estimate_yaw(landmarks, frame_w: int, frame_h: int) -> float | None:
 
 DEAD_ZONE_DEG = 8.0
 MAX_YAW_DEG = 45.0
-MAX_BALANCE = 0.38
+MAX_BALANCE = 0.50
 
 
 def yaw_to_balance(yaw_deg: float) -> float:

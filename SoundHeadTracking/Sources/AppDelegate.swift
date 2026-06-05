@@ -37,11 +37,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
     private var headTracker:      HeadTracker?
     private var balanceCtrl:      AudioBalanceController?
     private var trackingOn       = false
-    private var yawSmoother      = SmoothedYaw(alpha: 0.18, maxJump: 25.0)
-    private var balanceSmoother  = EMA(alpha: 0.18)
+    private var yawSmoother      = SmoothedYaw(alpha: 0.5, maxJump: 40.0)
+    private var balanceSmoother  = EMA(alpha: 0.5)
     private var lastYaw:         Double?
-    private var yawCenter:       Double = 0       // adaptive neutral-yaw estimate
+    private var yawCenter:       Double = 0       // neutral-yaw estimate
     private var yawCenterInit    = false
+    // First-second neutral calibration (handles a large constant bias that the
+    // near-centre adaptive drift can't climb to on its own).
+    private var calibrating      = false
+    private var calibSamples:    [Double] = []
+    private var calibStart:      TimeInterval = 0
     private var noFaceSince:     TimeInterval?
     private var currentBalance:  Double = 0
 
@@ -152,6 +157,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
             action: #selector(onToggle), keyEquivalent: "")
         toggleItem.target = self
 
+        // Recenter — set "straight ahead" to the current head position.
+        let recenterItem = menu.addItem(
+            withTitle: "Recenter (look straight first)",
+            action: #selector(onRecenter), keyEquivalent: "r")
+        recenterItem.target = self
+
         menu.addItem(.separator())
 
         // Section 4: open Sound Settings.
@@ -187,6 +198,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
         if trackingOn { disableTracking() } else { enableTracking() }
     }
 
+    /// Set the current head position as "straight ahead" (instant neutral).
+    @objc private func onRecenter() {
+        guard trackingOn else { return }
+        yawCenter     = yawSmoother.value
+        yawCenterInit = true
+        calibrating   = false
+        balanceSmoother.reset()
+    }
+
     private func enableTracking() {
         trackingOn = true
         toggleItem?.state = .on
@@ -199,6 +219,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
         lastYaw        = nil
         yawCenter      = 0
         yawCenterInit  = false
+        calibrating    = true
+        calibSamples   = []
+        calibStart     = ProcessInfo.processInfo.systemUptime
         noFaceSince    = nil
         currentBalance = 0
         faceWasDetected = false
@@ -251,23 +274,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
         if face {
             let smooth = yawSmoother.update(yaw)
 
-            // Adaptive neutral-yaw calibration.  The mapping assumes the
-            // resting head yaw is 0°, but camera angle / posture introduce a
-            // constant bias that the quadratic curve amplifies into a strong
-            // left/right asymmetry.  Seed the centre from the first reading,
-            // then drift it slowly toward the resting yaw ONLY while the head
-            // is near-centre — so a sustained turn is never cancelled out.
-            if !yawCenterInit {
-                yawCenter     = smooth
-                yawCenterInit = true
-            } else if abs(smooth - yawCenter) < kDeadZoneDeg {
-                yawCenter += 0.02 * (smooth - yawCenter)
-            }
+            if calibrating {
+                // First ~1s after enabling: assume the user is facing the
+                // screen and average the readings to establish the neutral
+                // yaw.  This removes a constant camera/posture bias of ANY
+                // size (the near-centre drift below can only correct small
+                // residuals).  Hold balance centred while calibrating.
+                calibSamples.append(smooth)
+                if ProcessInfo.processInfo.systemUptime - calibStart >= 1.0,
+                   calibSamples.count >= 5 {
+                    yawCenter     = calibSamples.reduce(0, +) / Double(calibSamples.count)
+                    yawCenterInit = true
+                    calibrating   = false
+                }
+                lastYaw     = 0
+                noFaceSince = nil
+                target      = 0
+            } else {
+                // Slow near-centre drift to track small residual bias.
+                if !yawCenterInit {
+                    yawCenter     = smooth
+                    yawCenterInit = true
+                } else if abs(smooth - yawCenter) < kDeadZoneDeg {
+                    yawCenter += 0.02 * (smooth - yawCenter)
+                }
 
-            let centered = smooth - yawCenter
-            lastYaw     = centered
-            noFaceSince = nil
-            target      = yawToBalance(centered)
+                let centered = smooth - yawCenter
+                lastYaw     = centered
+                noFaceSince = nil
+                target      = yawToBalance(centered)
+            }
         } else {
             if noFaceSince == nil {
                 noFaceSince = ProcessInfo.processInfo.systemUptime

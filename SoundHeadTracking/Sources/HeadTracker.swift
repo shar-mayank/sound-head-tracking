@@ -1,13 +1,16 @@
 // HeadTracker.swift — Webcam capture + Apple Vision face-landmark yaw.
 //
-// Replaces the Python MediaPipe + OpenCV pipeline with native macOS
-// frameworks: AVFoundation for the camera, Vision for face landmarks.
+// Yaw is computed GEOMETRICALLY from the eyes + nose, the same class of
+// approach that works in the Python MediaPipe script (Vision has no ear
+// landmarks, so we use eyes — which also never get occluded when turning).
 //
-// Yaw is computed GEOMETRICALLY from the eyes + nose (not Vision's coarse
-// built-in `.yaw`, and not the ears).  Eyes stay visible across the whole
-// comfortable turn range, so the signal is symmetric left/right — unlike
-// ear-based geometry, where the far ear is occluded and its guessed
-// position makes one direction collapse to near-zero.
+// Key properties:
+//   • Roll-invariant: the nose offset is projected onto the eye-line axis,
+//     so tilting the head while facing the screen does NOT change the yaw.
+//   • Quality-gated: low-quality frames are skipped (value held) instead of
+//     collapsing to ~0.
+//   • Frame-throttled + reduced camera fps to keep CPU low.
+//   • Self-healing: a stalled capture session is rebuilt automatically.
 
 import AVFoundation
 import CoreMedia
@@ -33,7 +36,10 @@ final class HeadTracker: NSObject {
 
     /// `+1` if turning the head right should yield positive yaw; flip to `-1`
     /// if the left/right sense is ever inverted on a particular machine.
-    private let kYawSign: Double = 1.0
+    private let kYawSign: Double = -1.0
+
+    /// Frames per second to *process* with Vision (camera is also capped here).
+    private let targetFPS: Double = 12.0
 
     weak var delegate: HeadTrackerDelegate?
 
@@ -42,10 +48,19 @@ final class HeadTracker: NSObject {
                                        qos: .userInteractive)
     private var running = false
 
-    // Reusable Vision request (serial queue → safe to share).
-    private let request = VNDetectFaceLandmarksRequest()
+    // Vision request (configured once, reused on the serial queue).
+    private let request: VNDetectFaceLandmarksRequest = {
+        let r = VNDetectFaceLandmarksRequest()
+        r.revision = VNDetectFaceLandmarksRequestRevision3
+        r.constellation = .constellation76Points   // includes pupils
+        return r
+    }()
 
-    // Watchdog: monotonic timestamp of the last delivered frame.
+    // Vision-processing throttle (capture-queue only).
+    private var lastProcess: TimeInterval = 0
+    private var minInterval: TimeInterval { 1.0 / 13.0 }   // slightly > targetFPS
+
+    // Watchdog: monotonic timestamp of the last delivered camera frame.
     private let stateLock = NSLock()
     private var lastFrameStamp: TimeInterval = 0
 
@@ -128,6 +143,17 @@ final class HeadTracker: NSObject {
 
         sess.addInput(input)
 
+        // Cap camera frame rate (best effort) to cut capture + Vision cost.
+        if let range = camera.activeFormat.videoSupportedFrameRateRanges.first,
+           Double(range.minFrameRate) <= targetFPS,
+           targetFPS <= Double(range.maxFrameRate),
+           (try? camera.lockForConfiguration()) != nil {
+            let d = CMTime(value: 1, timescale: CMTimeScale(targetFPS))
+            camera.activeVideoMinFrameDuration = d
+            camera.activeVideoMaxFrameDuration = d
+            camera.unlockForConfiguration()
+        }
+
         // Fresh output each time (an output can only belong to one session).
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
@@ -185,16 +211,20 @@ extension HeadTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
         else { return }
 
-        markFrame()
+        markFrame()   // camera liveness (watchdog) — every received frame
+
+        // Throttle expensive Vision work to ~targetFPS.
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastProcess >= minInterval else { return }
+        lastProcess = now
 
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer,
                                             orientation: .up,
                                             options: [:])
         try? handler.perform([request])
 
-        guard let face = request.results?.first,
-              let yaw = Self.geometricYaw(face, sign: kYawSign)
-        else {
+        // Genuinely no face → tell the app (it fades to centre).
+        guard let face = request.results?.first else {
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.delegate?.headTracker(self, didUpdate: 0, face: false)
@@ -202,44 +232,69 @@ extension HeadTracker: AVCaptureVideoDataOutputSampleBufferDelegate {
             return
         }
 
+        // Face present but low-quality landmarks → SKIP (hold last value)
+        // rather than collapse the yaw toward zero.
+        guard let yaw = Self.geometricYaw(face, sign: kYawSign) else { return }
+
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.delegate?.headTracker(self, didUpdate: yaw, face: true)
         }
     }
 
-    /// Geometric head yaw (degrees) from eye + nose landmarks.
-    ///
-    /// The horizontal offset of the nose from the eye midpoint, normalised by
-    /// the eye half-span, gives a scale-invariant signal symmetric in both
-    /// directions.  Positive (× `sign`) = user turned to THEIR right.
+    /// Roll-invariant geometric head yaw (degrees) from eye + nose landmarks.
+    /// Positive (× `sign`) = user turned to THEIR right.  Returns `nil` for
+    /// unusable frames (missing/collapsed landmarks) so the caller can hold.
     static func geometricYaw(_ face: VNFaceObservation, sign: Double) -> Double? {
-        guard let lm = face.landmarks,
-              let leftEye  = lm.leftEye,
-              let rightEye = lm.rightEye,
-              let nose     = lm.nose
-        else { return nil }
+        guard let lm = face.landmarks else { return nil }
 
-        func centroidX(_ region: VNFaceLandmarkRegion2D) -> Double {
-            let pts = region.normalizedPoints
-            guard !pts.isEmpty else { return .nan }
-            return pts.reduce(0.0) { $0 + Double($1.x) } / Double(pts.count)
+        // Use a CONSISTENT eye-centre source for both eyes — mixing a pupil
+        // point on one eye with an eye-outline centroid on the other injects a
+        // fake horizontal offset (spurious yaw).  Prefer both pupils; else
+        // fall back to both eye outlines.
+        let leftEye: CGPoint
+        let rightEye: CGPoint
+        if let lp = lm.leftPupil, let rp = lm.rightPupil,
+           !lp.normalizedPoints.isEmpty, !rp.normalizedPoints.isEmpty {
+            leftEye = centroid(lp); rightEye = centroid(rp)
+        } else if let le = lm.leftEye, let re = lm.rightEye,
+                  !le.normalizedPoints.isEmpty, !re.normalizedPoints.isEmpty {
+            leftEye = centroid(le); rightEye = centroid(re)
+        } else {
+            return nil
         }
 
-        let lx = centroidX(leftEye)
-        let rx = centroidX(rightEye)
-        let nx = centroidX(nose)
-        guard lx.isFinite, rx.isFinite, nx.isFinite else { return nil }
+        guard let noseR = lm.nose, !noseR.normalizedPoints.isEmpty
+        else { return nil }
+        let nose = centroid(noseR)
+        guard leftEye.x.isFinite, rightEye.x.isFinite, nose.x.isFinite
+        else { return nil }
 
-        let eyeMid   = (lx + rx) / 2.0
-        let halfSpan = abs(rx - lx) / 2.0
-        guard halfSpan > 0.001 else { return nil }
+        // Eye-line vector (rotates with head tilt).
+        let ex = rightEye.x - leftEye.x
+        let ey = rightEye.y - leftEye.y
+        let span = (ex * ex + ey * ey).squareRoot()
+        guard span > 0.05 else { return nil }   // eyes collapsed → unreliable
 
-        // Raw (un-mirrored) camera: turning right moves the nose toward
-        // image-left (smaller x), so (eyeMid − nose) is positive on a right
-        // turn.  Normalised by eye half-span → scale-invariant ratio.
-        let ratio   = (eyeMid - nx) / halfSpan
+        // Project the nose offset onto the eye-line axis → roll-invariant.
+        let axisX = ex / span
+        let axisY = ey / span
+        let eyeMidX = (leftEye.x + rightEye.x) / 2
+        let eyeMidY = (leftEye.y + rightEye.y) / 2
+        let along = (nose.x - eyeMidX) * axisX + (nose.y - eyeMidY) * axisY
+
+        let ratio   = Double(along) / Double(span / 2)
         let clamped = max(-2.0, min(2.0, ratio))
         return sign * clamped * kRatioToDeg
+    }
+
+    // MARK: Landmark helpers
+
+    private static func centroid(_ region: VNFaceLandmarkRegion2D) -> CGPoint {
+        let pts = region.normalizedPoints
+        guard !pts.isEmpty else { return CGPoint(x: CGFloat.nan, y: CGFloat.nan) }
+        var sx: CGFloat = 0, sy: CGFloat = 0
+        for p in pts { sx += p.x; sy += p.y }
+        return CGPoint(x: sx / CGFloat(pts.count), y: sy / CGFloat(pts.count))
     }
 }

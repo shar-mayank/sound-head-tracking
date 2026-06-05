@@ -40,6 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
     private var yawSmoother      = SmoothedYaw(alpha: 0.18, maxJump: 25.0)
     private var balanceSmoother  = EMA(alpha: 0.18)
     private var lastYaw:         Double?
+    private var yawCenter:       Double = 0       // adaptive neutral-yaw estimate
+    private var yawCenterInit    = false
     private var noFaceSince:     TimeInterval?
     private var currentBalance:  Double = 0
 
@@ -195,6 +197,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
         yawSmoother.reset()
         balanceSmoother.reset()
         lastYaw        = nil
+        yawCenter      = 0
+        yawCenterInit  = false
         noFaceSince    = nil
         currentBalance = 0
         faceWasDetected = false
@@ -246,9 +250,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
         let target: Double
         if face {
             let smooth = yawSmoother.update(yaw)
-            lastYaw     = smooth
+
+            // Adaptive neutral-yaw calibration.  The mapping assumes the
+            // resting head yaw is 0°, but camera angle / posture introduce a
+            // constant bias that the quadratic curve amplifies into a strong
+            // left/right asymmetry.  Seed the centre from the first reading,
+            // then drift it slowly toward the resting yaw ONLY while the head
+            // is near-centre — so a sustained turn is never cancelled out.
+            if !yawCenterInit {
+                yawCenter     = smooth
+                yawCenterInit = true
+            } else if abs(smooth - yawCenter) < kDeadZoneDeg {
+                yawCenter += 0.02 * (smooth - yawCenter)
+            }
+
+            let centered = smooth - yawCenter
+            lastYaw     = centered
             noFaceSince = nil
-            target      = yawToBalance(smooth)
+            target      = yawToBalance(centered)
         } else {
             if noFaceSince == nil {
                 noFaceSince = ProcessInfo.processInfo.systemUptime
@@ -289,6 +308,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
     private func refreshDisplay() {
         guard trackingOn else { return }
 
+        // Watchdog: if the camera has stalled (no frames for >2s), the yaw
+        // would otherwise get "stuck" at its last value until the user toggles
+        // off/on.  Rebuild the capture session automatically instead.
+        if let ht = headTracker, ht.secondsSinceLastFrame > 2.0 {
+            ht.restart()
+        }
+
         // Check for device hot-swap.
         if let newID = try? AudioBalanceController.defaultOutputDevice(),
            newID != balanceCtrl?.deviceID {
@@ -300,9 +326,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HeadTrackerDelegate {
             deviceTypeItem?.title = "Device type:  \(type)"
         }
 
-        // Yaw label.
-        if lastYaw != nil {
-            yawItem?.title = String(format: "Yaw:       %+6.1f°", yawSmoother.value)
+        // Yaw label (calibrated: ~0° at rest, symmetric at the extremes).
+        if let y = lastYaw {
+            yawItem?.title = String(format: "Yaw:       %+6.1f°", y)
         } else {
             yawItem?.title = "Yaw:          --"
         }

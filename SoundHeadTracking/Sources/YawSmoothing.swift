@@ -11,6 +11,11 @@ let kDeadZoneDeg: Double = 8.0
 let kMaxYawDeg:   Double = 45.0
 let kMaxBalance:  Double = 0.38
 
+/// Scale converting the eye/nose geometric ratio into degrees of yaw.
+/// (Eyes sit closer together than ears, so this is smaller than the Python
+/// ear-based script's 40°.)  A ratio of ~1.0 ≈ a strong deliberate turn.
+let kRatioToDeg:  Double = 45.0
+
 // MARK: - SmoothedYaw (double-EMA + outlier gate)
 
 /// Two-stage smoother with outlier rejection for yaw angles.
